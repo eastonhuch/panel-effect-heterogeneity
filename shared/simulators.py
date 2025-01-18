@@ -1,5 +1,6 @@
 import numpy as np
 from abc import ABC, abstractmethod
+from typing import Union
 
 
 class BaseEffectSimulator(ABC):
@@ -11,12 +12,13 @@ class BaseEffectSimulator(ABC):
         pass
     
     @abstractmethod
-    def simulate_y1(self, x, y0):
+    def simulate_y1(self, x: np.ndarray, y0: np.ndarray) -> np.ndarray:
         pass
 
 
 class ConstantEffectSimulator(BaseEffectSimulator):
-    def __init__(self, name, N, mu_mean, mu_sd, tau, epsilon_sd=None):
+    def __init__(self, name: str, N: int, mu_mean: float, mu_sd: float,
+                 tau: float, epsilon_sd: Union[None, float]=None):
         self.name = name
         self.N = N
         self.mu_mean = mu_mean
@@ -24,12 +26,12 @@ class ConstantEffectSimulator(BaseEffectSimulator):
         self.tau = tau
         self.epsilon_sd = epsilon_sd
         
-    def sample_params(self):
+    def sample_params(self) -> 'ConstantEffectSimulator':
         self.mu = np.random.normal(loc=self.mu_mean, scale=self.mu_sd)
         self.theta = np.random.normal(loc=self.mu, scale=self.tau, size=self.N)
         return self
         
-    def simulate_y1(self, x, y0):
+    def simulate_y1(self, x: np.ndarray, y0: np.ndarray) -> np.ndarray:
         y1 = y0 + self.theta
         if self.epsilon_sd is not None:
             y1 += np.random.normal(scale=self.epsilon_sd, size=y1.shape)
@@ -37,7 +39,9 @@ class ConstantEffectSimulator(BaseEffectSimulator):
     
 
 class ModeratedEffectSimulator(BaseEffectSimulator):
-    def __init__(self, name, N, mu_mean, mu_sd, tau, beta_mean, beta_sd, epsilon_sd=None):
+    def __init__(self, name: str, N: int, mu_mean: float, mu_sd: float,
+                 tau: float, beta_mean: float, beta_sd: float, 
+                 epsilon_sd: Union[None, float]=None):
         self.name = name
         self.N = N
         self.mu_mean = mu_mean
@@ -47,13 +51,13 @@ class ModeratedEffectSimulator(BaseEffectSimulator):
         self.beta_sd = beta_sd
         self.epsilon_sd = epsilon_sd
         
-    def sample_params(self):
+    def sample_params(self) -> 'ModeratedEffectSimulator':
         self.mu = np.random.normal(loc=self.mu_mean, scale=self.mu_sd)
         self.theta = np.random.normal(loc=self.mu, scale=self.tau, size=self.N)
         self.beta = np.random.normal(loc=self.beta_mean, scale=self.beta_sd, size=self.N)
         return self
         
-    def simulate_y1(self, x, y0):
+    def simulate_y1(self, x: np.ndarray, y0: np.ndarray) -> np.ndarray:
         y1 = y0 + self.theta + x * self.beta
         if self.epsilon_sd is not None:
             y1 += np.random.normal(scale=self.epsilon_sd, size=y1.shape)
@@ -65,7 +69,7 @@ class DataSimulator():
         self.N = N
         self.T = T
 
-    def simulate(self, effect_generator: BaseEffectSimulator):
+    def simulate(self, effect_generator: BaseEffectSimulator) -> 'DataSimulator':
         # Create placeholders
         x = np.zeros((self.N, self.T+1))
         p = x.copy()
@@ -99,6 +103,7 @@ class DataSimulator():
         self.x = x[:, 1:]
         self.p = x[:, 1:]
         self.a = a[:, 1:]
+        self.not_a = ~self.a.copy()
         self.y0 = y0[:, 1:]
         self.y1 = y1[:, 1:]
         self.y = y[:, 1:]
