@@ -1,6 +1,7 @@
 import numpy as np
 from scipy.stats import norm
 from abc import ABC, abstractmethod
+from typing import Union, List
 from shared.simulators import DataSimulator
 from shared.result_processors import UserResults
 
@@ -21,6 +22,10 @@ class BaseAnalyzer(ABC):
     def analyze(self, data_simulator: DataSimulator, fit: bool = True) -> UserResults:
         pass
     
+    def set_i(self, i: int) -> 'BaseAnalyzer':
+        self.i = i
+        return self
+
 
 class FixedEffectsAnalyzer(BaseAnalyzer):
 
@@ -57,3 +62,35 @@ class FixedEffectsAnalyzer(BaseAnalyzer):
         if fit:
             self.fit(data_simulator)
         return UserResults(self.user_estimates, self.user_cis, self.mean_estimate, self.mean_ci)
+    
+
+class AnalyzerCollection():
+    def __init__(self, analyzers: Union[None, BaseAnalyzer, List[BaseAnalyzer]] = None):
+        self.names = []
+        self.num_analyzers = 0
+        self.analyzers = []
+        if analyzers is None:
+            analyzers = []
+        if not isinstance(analyzers, list):
+            analyzers = [analyzers]
+        for analyzer in analyzers:
+            self.add_analyzer(analyzer)
+
+    def add_analyzer(self, analyzer: BaseAnalyzer) -> 'AnalyzerCollection':
+        if analyzer.name in self.names:
+            raise ValueError(f"Analyzer name '{analyzer.name}' already exists.")
+        analyzer.set_i(self.num_analyzers)
+        self.analyzers.append(analyzer)
+        self.num_analyzers += 1
+        return self
+    
+    def __iter__(self):
+        self.iter_idx = 0
+        return self
+    
+    def __next__(self):
+        if self.iter_idx >= self.num_analyzers:
+            raise StopIteration
+        analyzer = self.analyzers[self.iter_idx]
+        self.iter_idx += 1
+        return analyzer

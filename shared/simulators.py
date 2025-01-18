@@ -1,11 +1,12 @@
 import numpy as np
 from abc import ABC, abstractmethod
-from typing import Union
+from typing import Union, List
 
 
 class BaseEffectSimulator(ABC):
     name: str
     N: int
+    i: int  # Index of the effect simulator in the collection
 
     @abstractmethod
     def sample_params(self):
@@ -14,6 +15,10 @@ class BaseEffectSimulator(ABC):
     @abstractmethod
     def simulate_y1(self, x: np.ndarray, y0: np.ndarray) -> np.ndarray:
         pass
+
+    def set_i(self, i: int) -> 'BaseEffectSimulator':
+        self.i = i
+        return self
 
 
 class ConstantEffectSimulator(BaseEffectSimulator):
@@ -62,6 +67,37 @@ class ModeratedEffectSimulator(BaseEffectSimulator):
         if self.epsilon_sd is not None:
             y1 += np.random.normal(scale=self.epsilon_sd, size=y1.shape)
         return y1
+    
+class EffectsSimulatorCollection():
+    def __init__(self, effect_simulators: Union[None, BaseEffectSimulator, List[BaseEffectSimulator]] = None):
+        self.names = []
+        self.num_effect_simulators = 0
+        self.effect_simulators = []
+        if effect_simulators is None:
+            effect_simulators = []
+        elif not isinstance(effect_simulators, list):
+            effect_simulators = [effect_simulators]
+        for effect_simulator in effect_simulators:
+            self.add_effect_simulator(effect_simulator)
+
+    def add_effect_simulator(self, effect_simulator: BaseEffectSimulator) -> 'EffectsSimulatorCollection':
+        if effect_simulator.name in self.names:
+            raise ValueError(f"Effect Simulator '{effect_simulator.name}' already exists in collection.")
+        effect_simulator.set_i(self.num_effect_simulators)
+        self.effect_simulators.append(effect_simulator)
+        self.num_effect_simulators += 1
+        return self
+    
+    def __iter__(self):
+        self.iter_idx = 0
+        return self
+    
+    def __next__(self):
+        if self.iter_idx >= self.num_effect_simulators:
+            raise StopIteration
+        effect_simulator = self.effect_simulators[self.iter_idx]
+        self.iter_idx += 1
+        return effect_simulator
     
 
 class DataSimulator():
