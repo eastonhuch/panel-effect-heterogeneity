@@ -1,6 +1,7 @@
 import numpy as np
 from abc import ABC, abstractmethod
-from typing import Union, List
+from typing import Union, List, Literal
+from shared.utils import chol_inv_stack
 
 
 class BaseEffectSimulator(ABC):
@@ -37,7 +38,7 @@ class ConstantEffectSimulator(BaseEffectSimulator):
         return self
         
     def simulate_y1(self, x: np.ndarray, y0: np.ndarray) -> np.ndarray:
-        y1 = y0 + self.theta
+        y1 = (y0.T + self.theta).T
         if self.epsilon_sd is not None:
             y1 += np.random.normal(scale=self.epsilon_sd, size=y1.shape)
         return y1
@@ -63,7 +64,7 @@ class ModeratedEffectSimulator(BaseEffectSimulator):
         return self
         
     def simulate_y1(self, x: np.ndarray, y0: np.ndarray) -> np.ndarray:
-        y1 = y0 + self.theta + x * self.beta
+        y1 = (y0.T + self.theta + x.T * self.beta).T
         if self.epsilon_sd is not None:
             y1 += np.random.normal(scale=self.epsilon_sd, size=y1.shape)
         return y1
@@ -73,6 +74,7 @@ class EffectsSimulatorCollection():
         self.names = []
         self.num_effect_simulators = 0
         self.effect_simulators = []
+        self.N = None
         if effect_simulators is None:
             effect_simulators = []
         elif not isinstance(effect_simulators, list):
@@ -83,8 +85,11 @@ class EffectsSimulatorCollection():
     def add_effect_simulator(self, effect_simulator: BaseEffectSimulator) -> 'EffectsSimulatorCollection':
         if effect_simulator.name in self.names:
             raise ValueError(f"Effect Simulator '{effect_simulator.name}' already exists in collection.")
+        if (self.N is not None) and (self.N != effect_simulator.N):
+            raise ValueError(f"Effect Simulator has N={effect_simulator.N}; I expected {self.N}.")
         effect_simulator.set_i(self.num_effect_simulators)
         self.effect_simulators.append(effect_simulator)
+        self.names.append(effect_simulator.name)
         self.num_effect_simulators += 1
         return self
     
@@ -98,51 +103,78 @@ class EffectsSimulatorCollection():
         effect_simulator = self.effect_simulators[self.iter_idx]
         self.iter_idx += 1
         return effect_simulator
-    
+
 
 class DataSimulator():
+    weight_func_dict = {
+        "ATE": lambda p: np.ones_like(p),
+        "ATO": lambda p: p * (1. - p),
+        "ATT": lambda p: p,
+        "ATC": lambda p: 1. - p,
+    }
+
     def __init__(self, N: int, T: int):
         self.N = N
         self.T = T
+        self.D = 2  # Dimension of theta
+    
+    def simulate_history(self, weight_type: Literal["ATE", "ATO", "ATT", "ATC"] = "ATE") -> 'DataSimulator':
+        available_weight_types = list(self.weight_func_dict.keys())
+        if weight_type not in available_weight_types:
+            raise ValueError(f"weight_type must be in {available_weight_types}")
+        weight_func = self.weight_func_dict[weight_type]
 
-    def simulate(self, effect_generator: BaseEffectSimulator) -> 'DataSimulator':
         # Create placeholders
         x = np.zeros((self.N, self.T+1))
         p = x.copy()
-        a = x.copy().astype(bool)
         y0 = x.copy()
-        y1 = x.copy()
-        y = x.copy()
 
         # Simulate intial values
         x[:, 0] = np.random.normal(size=self.N)
         y0[:, 0] = np.random.normal(size=self.N)
-        y[:, 0] = y0[:, 0]
 
         # Simulate remaining time points
         for t in range(1, self.T+1):
             x_t = 0.4*x[:, t-1] + 0.2*y0[:, t-1] + np.random.normal(size=self.N)
             p_t = 1. / (1. + np.exp(-x_t/2.))
-            a_t = np.random.random(size=p_t.shape) < p_t
-            y0_t = 0.2*x_t + 0.3*y[:, t-1] + np.random.normal(size=self.N)
-            y1_t = effect_generator.simulate_y1(x_t, y0_t)
-            y_t = a_t*y1_t + (1 - a_t)*y0_t            
+            y0_t = 0.2*x_t + 0.3*y0[:, t-1] + np.random.normal(size=self.N)
             x[:, t] = x_t
             p[:, t] = p_t
-            a[:, t] = a_t
             y0[:, t] = y0_t
-            y1[:, t] = y1_t
-            y[:, t] = y_t
 
         # Save data from t=1...T
         # NOTE: This discards the first time point
-        self.x = x[:, 1:]
-        self.p = x[:, 1:]
-        self.a = a[:, 1:]
-        self.not_a = ~self.a.copy()
+        self.x = x[:, 1:] + 1.  # Not mean centered
+        self.p = p[:, 1:]
+        self.w = weight_func(self.p.copy())
         self.y0 = y0[:, 1:]
-        self.y1 = y1[:, 1:]
-        self.y = y[:, 1:]
-        self.ites = self.y1 - self.y0
+        return self
+    
+    def simulate_a(self) -> 'DataSimulator':
+        self.a = np.random.random(size=self.p.shape) < self.p
+        self.not_a = ~self.a.copy()
+        return self
+
+    def simulate_effects(self, effect_generator: BaseEffectSimulator) -> 'DataSimulator':
+        self.y1 = effect_generator.simulate_y1(self.x, self.y0)
+        self.y = self.a * self.y1 + self.not_a * self.y0
+        self.tau = self.y1 - self.y0
+
+        # Compute true value of estimands
+        # Theta
+        self.X = np.ones((self.N, self.T, 2))
+        self.X[:, :, 1] = self.x.copy()
+        self.sqrt_w = np.sqrt(self.w)
+        self.W_sqrt_X = (self.X.T * self.sqrt_w.T).T
+        self.XtWX = np.swapaxes(self.W_sqrt_X, 1, 2) @ self.W_sqrt_X
+        self.XtWX_inv = chol_inv_stack(self.XtWX)
+        self.WX = (self.X.T * self.w.T).T
+        tau_row_vectors = self.tau.reshape((self.N, 1, self.T))
+        self.XtWtau = np.swapaxes(tau_row_vectors @ self.WX, 1, 2)
+        self.theta = (self.XtWX_inv @ self.XtWtau)[:, :, 0]
+
+        # User-level effects
+        w_mean = self.w.mean(axis=1)
+        self.user_effects = (self.tau * self.w).mean(axis=1) / w_mean
 
         return self
