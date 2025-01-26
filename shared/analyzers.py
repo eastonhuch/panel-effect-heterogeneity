@@ -1,32 +1,60 @@
 import numpy as np
 from scipy.stats import norm
 from abc import ABC, abstractmethod
-from typing import Union, List
+from typing import Union, List, Tuple
 from shared.simulators import DataSimulator
 from shared.inference_formats import UserInferences, ThetaInferences
-from shared.utils import chol_inv_stack
+from shared.utils import chol_inv_matrix, chol_inv_stack, re_mme
 
 
 class BaseAnalyzer(ABC):
     name: str
     alpha: float
 
-    def __init__(self, name: str, alpha: float=0.05):
-        self.name = name
-        self.alpha = alpha
-    
     @abstractmethod
+    def get_inferences(self, data_simulator: DataSimulator, X: np.ndarray) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+        pass
+        
     def get_theta_inferences(self, data_simulator: DataSimulator) -> ThetaInferences:
-        pass
+        X = np.ones((data_simulator.N, data_simulator.T, 2))
+        X[:, :, 1] = data_simulator.x.copy()
+        inferences = self.get_inferences(data_simulator, X)
+        theta_inferences = ThetaInferences(*inferences, self.alpha)
+        return theta_inferences
 
-    @abstractmethod
     def get_user_inferences(self, data_simulator: DataSimulator) -> UserInferences:
-        pass
+        X = np.ones((data_simulator.N, data_simulator.T, 1))
+        inferences = self.get_inferences(data_simulator, X)
+        user_inferences = UserInferences(*[x.squeeze() for x in inferences], self.alpha)
+        return user_inferences
     
     def set_i(self, i: int) -> 'BaseAnalyzer':
         self.i = i
         return self
+
+
+class StandaloneAnalyzer(BaseAnalyzer):
+    @abstractmethod
+    def get_estimates_mean_cov(self, data_simulator: DataSimulator, X: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
+        pass
+
+    def get_inferences(self, data_simulator: DataSimulator, X: np.ndarray) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+        estimates, estimates_cov = self.get_estimates_mean_cov(data_simulator, X)
+        N, _ = estimates.shape
+        theta_vars = np.diagonal(estimates_cov, axis1=1, axis2=2)
+        theta_ses = np.sqrt(theta_vars)
+        z_star = norm.ppf(1. - self.alpha / 2.)
+        u = estimates
+        u_lb = estimates - z_star * theta_ses
+        u_ub = estimates + z_star * theta_ses
+        m = u.mean(axis=0)
+        m_var = theta_vars.mean(axis=0) / N
+        m_se = np.sqrt(m_var)
+        m_lb = m - z_star * m_se
+        m_ub = m + z_star * m_se
+        return u, u_lb, u_ub, m, m_lb, m_ub
     
+
 class AnalyzerCollection():
     def __init__(self, analyzers: Union[None, BaseAnalyzer, List[BaseAnalyzer]] = None):
         self.names = []
@@ -65,106 +93,224 @@ class AnalyzerCollection():
 
 
 # Begin Analyzer implementations
-class WLSAnalyzer(BaseAnalyzer):
+class WLSMixin():
+    """Mixin that adds WLS estimates"""
+    def wls(self, data_simulator: DataSimulator, X_raw: np.ndarray):
+        # Extract data
+        N, T, D = X_raw.shape
+        a = data_simulator.a.copy()
+        not_p = data_simulator.not_p.copy()
+        y = data_simulator.y.copy()
+        w = data_simulator.w.copy()
+        sqrt_w = data_simulator.sqrt_w.copy()
+
+        # Construct X
+        X = np.ones((N, T, 2*D))
+        X[:, :, :D] = X_raw.copy()
+        X[:, :, D:] = (X_raw.copy().T * a.T).T
+
+        # Fit regression model
+        W_sqrt_X = (X.T * sqrt_w.T).T
+        XtWX = np.swapaxes(W_sqrt_X, 1, 2) @ W_sqrt_X
+        XtWX_inv = chol_inv_stack(XtWX)
+        WX = (X.T * w.T).T
+        y_row_vectors = y[:, np.newaxis, :]
+        XtWy = np.swapaxes(y_row_vectors @ WX, 1, 2)
+        theta_full_3d = (XtWX_inv @ XtWy)
+
+        # Construct fitted values, residuals
+        fitted_values = (X @ theta_full_3d).squeeze()
+        residuals = y - fitted_values
+
+        # Estimate covariance matrix
+        W_sqrt_R_X = (X.T * (residuals.T * sqrt_w.T)).T
+        meat = np.swapaxes(W_sqrt_R_X, 1, 2) @ W_sqrt_R_X
+        theta_full_cov = XtWX_inv @ meat @ XtWX_inv
+
+        # Create tau_hat_dr
+        beta1_minus_beta0 = theta_full_3d[:, D:]
+        estimated_effects = (X_raw @ beta1_minus_beta0).squeeze()
+        tau_hat_dr = residuals / (a - not_p) + estimated_effects
+
+        return theta_full_3d, theta_full_cov, residuals, tau_hat_dr
+    
+
+class TauMixin():
+    def get_tau_hat(self, data_simulator: DataSimulator, X: np.ndarray):
+        y = data_simulator.y
+        a = data_simulator.a
+        p = data_simulator.p
+        not_a = data_simulator.not_a
+        not_p = data_simulator.not_p
+        tau_hat = y * (a/p - not_a/not_p)
+        return tau_hat
+    
+
+class WLSAnalyzer(StandaloneAnalyzer, WLSMixin):
     """Weighted least squares analyzer.
     In general, this method is biased for the treatment effects.
     We include it as a baseline for comparison.
     """
     def __init__(self, name: str, alpha: float=0.05):
-        super().__init__(name, alpha)
+        self.name = name
+        self.alpha = alpha
 
-    def get_inferences(self, data_simulator: DataSimulator, X_raw: np.ndarray):
-        N, T, D = X_raw.shape
-        X = np.ones((N, T, 2*D))
-        X[:, :, :D] = X_raw.copy()
-        X[:, :, D:] = (X_raw.copy().T * data_simulator.a.T).T
-        W_sqrt_X = (X.T * data_simulator.sqrt_w.T).T
-        XtWX = np.swapaxes(W_sqrt_X, 1, 2) @ W_sqrt_X
-        XtWX_inv = chol_inv_stack(XtWX)
-        WX = (X.T * data_simulator.w.T).T
-        y_row_vectors = data_simulator.y[:, np.newaxis, :]
-        XtWy = np.swapaxes(y_row_vectors @ WX, 1, 2)
-        theta_full_3d = (XtWX_inv @ XtWy)
-        fitted_values = (X @ theta_full_3d).squeeze()
-        residuals = data_simulator.y - fitted_values
-        W_sqrt_R_X = (X.T * (residuals.T * data_simulator.sqrt_w.T)).T
-        meat = np.swapaxes(W_sqrt_R_X, 1, 2) @ W_sqrt_R_X
-        theta_full_cov = XtWX_inv @ meat @ XtWX_inv
-        theta_estimates_3d = theta_full_3d[:, D:]
-        u = theta_estimates_3d[:, :, 0]
-        theta_cov = theta_full_cov[np.ix_(range(N), range(D, 2*D), range(D, 2*D))]
-        theta_vars = np.diagonal(theta_cov, axis1=1, axis2=2)
-        theta_ses = np.sqrt(theta_vars)
-        z_star = norm.ppf(1. - self.alpha / 2.)
-        u_lb = u - z_star * theta_ses
-        u_ub = u + z_star * theta_ses
-        m = u.mean(axis=0)
-        m_var = theta_vars.mean(axis=0) / N
-        m_se = np.sqrt(m_var)
-        m_lb = m - z_star * m_se
-        m_ub = m + z_star * m_se
-        return u, u_lb, u_ub, m, m_lb, m_ub
+    def get_estimates_mean_cov(self, data_simulator: DataSimulator, X: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
+        # Get WLS estimates
+        N, T, D = X.shape
+        theta_full_3d, theta_full_cov, _, _ = self.wls(data_simulator, X)
+        estimates = theta_full_3d[:, D:, 0]
+        estimates_cov = theta_full_cov[np.ix_(range(N), range(D, 2*D), range(D, 2*D))]
+        return estimates, estimates_cov
 
-    def get_theta_inferences(self, data_simulator: DataSimulator) -> ThetaInferences:
-        X = np.ones((data_simulator.N, data_simulator.T, 2))
-        X[:, :, 1] = data_simulator.x.copy()
-        inferences = self.get_inferences(data_simulator, X)
-        theta_inferences = ThetaInferences(*inferences, self.alpha)
-        return theta_inferences
 
-    def get_user_inferences(self, data_simulator: DataSimulator) -> UserInferences:
-        X = np.ones((data_simulator.N, data_simulator.T, 1))
-        inferences = self.get_inferences(data_simulator, X)
-        user_inferences = UserInferences(*[x.squeeze() for x in inferences], self.alpha)
-        return user_inferences
-
-class IPWAnalyzer(BaseAnalyzer):
+class IPWAnalyzer(StandaloneAnalyzer, WLSMixin, TauMixin):
     """Inverse-probability weighting analyzer.
     This approach is unbiased, but is not very efficient.
     """
-    def __init__(self, name: str, alpha: float=0.05):
-        super().__init__(name, alpha)
+    def __init__(self, name: str, alpha: float=0.05, dr: bool = False):
+        self.name = name
+        self.alpha = alpha
+        self.dr = dr
 
-    def get_inferences(self, data_simulator: DataSimulator, X: np.ndarray):
+    def get_estimates_mean_cov(self, data_simulator: DataSimulator, X: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
+        # Extract data
         N, T, D = X.shape
         a = data_simulator.a.copy()
         p = data_simulator.p.copy()
         y = data_simulator.y.copy()
-        sqrt_w = data_simulator.sqrt_w
+        sqrt_w = data_simulator.sqrt_w.copy()
+
+        # Get tau_hat
+        if self.dr:
+            _, _, residuals, tau_hat = self.wls(data_simulator, X)
+        else:
+            tau_hat = self.get_tau_hat(data_simulator, X)
+            residuals = y
+        tau_hat_row_vectors = tau_hat[:, np.newaxis, :]
+
+        # Generate estimates
         W_sqrt_X = (X.T * sqrt_w.T).T
         XtWX = np.swapaxes(W_sqrt_X, 1, 2) @ W_sqrt_X
         XtWX_inv = chol_inv_stack(XtWX)
         WX = (X.T * data_simulator.w.T).T
-        tau_hat = y * (a/p - (1.-a)/(1.-p))
-        tau_hat_row_vectors = tau_hat[:, np.newaxis, :]
         XtWtau_hat = np.swapaxes(tau_hat_row_vectors @ WX, 1, 2)
-        theta_3d = (XtWX_inv @ XtWtau_hat)
-        u = theta_3d[:, :, 0]
-        s = (a-p) * y / (p * (1. - p))
+        estimates_3d = (XtWX_inv @ XtWtau_hat)
+        estimates = estimates_3d[:, :, 0]
+
+        # Estimate covariance
+        s = (a-p) * residuals / (p * (1. - p))
         W_sqrt_S_X = (X.T * (s.T * sqrt_w.T)).T
         meat = np.swapaxes(W_sqrt_S_X, 1, 2) @ W_sqrt_S_X
-        theta_cov = XtWX_inv @ meat @ XtWX_inv
-        theta_vars = np.diagonal(theta_cov, axis1=1, axis2=2)
+        estimates_cov = XtWX_inv @ meat @ XtWX_inv
+
+        return estimates, estimates_cov
+
+
+class SIPWAnalyzer(StandaloneAnalyzer, WLSMixin, TauMixin):
+    """Stabilized inverse-probability weighting analyzer.
+    This approach is unbiased and more efficient than standard IPW.
+    """
+    def __init__(self, name: str, alpha: float=0.05, dr: bool = False):
+        self.name = name
+        self.alpha = alpha
+        self.dr = dr
+
+    def get_estimates_mean_cov(self, data_simulator: DataSimulator, X: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
+        # Extract data
+        N, T, D = X.shape
+        a = data_simulator.a.copy()
+        not_a = data_simulator.not_a.copy()
+        p = data_simulator.p.copy()
+        not_p = data_simulator.not_p.copy()
+        y = data_simulator.y.copy()
+        w = data_simulator.w.copy()
+        sqrt_w = data_simulator.sqrt_w.copy()
+
+        # Get tau_hat
+        if self.dr:
+            _, _, residuals, tau_hat = self.wls(data_simulator, X)
+        else:
+            tau_hat = self.get_tau_hat(data_simulator, X)
+            residuals = y
+
+        # Get estimates
+        awp0 = not_a*w/not_p
+        awp1 = a*w/p
+        AWP0X = (X.T * np.sqrt(awp0.T)).T
+        AWP1X = (X.T * np.sqrt(awp1.T)).T
+        B0 = (np.swapaxes(AWP0X, 1, 2) @ AWP0X) / T
+        B0_inv = chol_inv_stack(B0)
+        B1 = (np.swapaxes(AWP1X, 1, 2) @ AWP1X) / T
+        B1_inv = chol_inv_stack(B1)
+        z0 = (X.T * (not_a * w * tau_hat).T).T.mean(axis=1)[:, :, np.newaxis]  # N x D x 1
+        z1 = (X.T * (a * w * tau_hat).T).T.mean(axis=1)[:, :, np.newaxis]  # N x D x 1
+        estimates_3d = B0_inv @ z0 + B1_inv @ z1
+        estimates = estimates_3d[:, :, 0]
+
+        # Estimate covariance
+        W_sqrt_X = (X.T * sqrt_w.T).T
+        B = (np.swapaxes(W_sqrt_X, 1, 2) @ W_sqrt_X) / T
+        B_inv = chol_inv_stack(B)
+        B_inv_rep = np.repeat(B_inv[:, np.newaxis, :, :], T, axis=1)
+        B_double_inv = B_inv @ B_inv
+
+        B_double_inv_z0 = (B_double_inv @ z0)[:, :, 0]  # N x D
+        B_double_inv_z0_rep = np.repeat(B_double_inv_z0[:, np.newaxis, :], T, axis=1)  # N x T x D
+        v0_right_tmp = (X * B_double_inv_z0_rep).sum(axis=2)  # N x T
+        v01_left = (B_inv_rep @ ((X.T * residuals.T).T[:, :, :, np.newaxis]))[:, :, :, 0]  # N x T x D
+        v0_right = (X.T * v0_right_tmp.T).T  # N x T x D
+        v0 = v01_left + v0_right  # N x T x D
+        v0_awp0 = (v0.T * awp0.T).T
+        V0 = np.swapaxes(v0_awp0, 1, 2) @ v0_awp0
+
+        B_double_inv_z1 = (B_double_inv @ z1)[:, :, 0]  # N x D
+        B_double_inv_z1_rep = np.repeat(B_double_inv_z1[:, np.newaxis, :], T, axis=1)  # N x T x D
+        v1_right_tmp = (X * B_double_inv_z1_rep).sum(axis=2)  # N x T
+        v1_right = (X.T * v1_right_tmp.T).T  # N x T x D
+        v1 = v01_left - v1_right  # N x T x D
+        v1_awp1 = (v1.T * awp1.T).T
+        V1 = np.swapaxes(v1_awp1, 1, 2) @ v1_awp1
+
+        estimates_cov = (V0 + V1) / T**2
+
+        return estimates, estimates_cov
+
+
+class MetaAnalyzer(BaseAnalyzer):
+    """Meta-analyzer.
+    This approach uses composition to obtain
+    improved estimates via Gaussian meta-analysis.
+    """
+    def __init__(self, analyzer: BaseAnalyzer, name: str, alpha: float=0.05):
+        self.analyzer = analyzer
+        self.name = name
+        self.alpha = alpha
+
+    def get_inferences(self, data_simulator: DataSimulator, X: np.ndarray) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+        raw_estimates, raw_estimates_cov = self.analyzer.get_estimates_mean_cov(data_simulator, X)
+        overall_mean, overall_mean_cov, overall_cov = re_mme(raw_estimates, raw_estimates_cov)
+        overall_precision = chol_inv_matrix(overall_cov)
+        overall_precision_mean = overall_precision @ overall_mean
+        raw_estimates_precision = chol_inv_stack(raw_estimates_cov)
+        estimates_precision = overall_precision + raw_estimates_precision
+        estimates_cov = chol_inv_stack(estimates_precision)
+        estimates_right = overall_precision_mean + raw_estimates_precision @ raw_estimates[:, :, np.newaxis]
+        estimates = (estimates_cov @ estimates_right)[:, :, 0]
+
+        N, _ = estimates.shape
+        theta_vars = np.diagonal(estimates_cov, axis1=1, axis2=2)
         theta_ses = np.sqrt(theta_vars)
         z_star = norm.ppf(1. - self.alpha / 2.)
-        u_lb = u - z_star * theta_ses
-        u_ub = u + z_star * theta_ses
-        m = u.mean(axis=0)
-        m_var = theta_vars.mean(axis=0) / N
+        u = estimates
+        u_lb = estimates - z_star * theta_ses
+        u_ub = estimates + z_star * theta_ses
+
+        # Use the raw estimates for the mean effects
+        m = overall_mean
+        m_var = np.diag(overall_mean_cov)
         m_se = np.sqrt(m_var)
         m_lb = m - z_star * m_se
         m_ub = m + z_star * m_se
+
         return u, u_lb, u_ub, m, m_lb, m_ub
-
-    def get_theta_inferences(self, data_simulator: DataSimulator) -> ThetaInferences:
-        X = np.ones((data_simulator.N, data_simulator.T, 2))
-        X[:, :, 1] = data_simulator.x.copy()
-        inferences = self.get_inferences(data_simulator, X)
-        theta_inferences = ThetaInferences(*inferences, self.alpha)
-        return theta_inferences
-
-    def get_user_inferences(self, data_simulator: DataSimulator) -> UserInferences:
-        X = np.ones((data_simulator.N, data_simulator.T, 1))
-        inferences = self.get_inferences(data_simulator, X)
-        user_inferences = UserInferences(*[x.squeeze() for x in inferences], self.alpha)
-        return user_inferences

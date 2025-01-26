@@ -69,7 +69,7 @@ class ModeratedEffectSimulator(BaseEffectSimulator):
             y1 += np.random.normal(scale=self.epsilon_sd, size=y1.shape)
         return y1
     
-class EffectsSimulatorCollection():
+class EffectSimulatorCollection():
     def __init__(self, effect_simulators: Union[None, BaseEffectSimulator, List[BaseEffectSimulator]] = None):
         self.names = []
         self.num_effect_simulators = 0
@@ -82,7 +82,7 @@ class EffectsSimulatorCollection():
         for effect_simulator in effect_simulators:
             self.add_effect_simulator(effect_simulator)
 
-    def add_effect_simulator(self, effect_simulator: BaseEffectSimulator) -> 'EffectsSimulatorCollection':
+    def add_effect_simulator(self, effect_simulator: BaseEffectSimulator) -> 'EffectSimulatorCollection':
         if effect_simulator.name in self.names:
             raise ValueError(f"Effect Simulator '{effect_simulator.name}' already exists in collection.")
         if (self.N is not None) and (self.N != effect_simulator.N):
@@ -144,10 +144,11 @@ class DataSimulator():
 
         # Save data from t=1...T
         # NOTE: This discards the first time point
-        self.x = x[:, 1:] + 1.  # Not mean centered
-        self.p = p[:, 1:]
+        self.x = x[:, 1:].copy() + 1.  # Not mean centered
+        self.p = p[:, 1:].copy()
+        self.not_p = 1. - self.p
         self.w = weight_func(self.p.copy())
-        self.y0 = y0[:, 1:]
+        self.y0 = y0[:, 1:].copy() - 2.  # Not mean centered
         return self
     
     def simulate_a(self) -> 'DataSimulator':
