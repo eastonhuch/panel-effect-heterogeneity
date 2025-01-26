@@ -1,13 +1,13 @@
 import numpy as np
 import pandas as pd
-from shared.simulators import DataSimulator, EffectsSimulatorCollection
+from shared.simulators import DataSimulator, EffectSimulatorCollection
 from shared.analyzers import AnalyzerCollection
 from shared.inference_formats import UserInferences, ThetaInferences
 from shared.utils import float2str_format, print_se_parentheses
 
 
 class Results():
-    def __init__(self, data_simulator: DataSimulator, effect_simulators: EffectsSimulatorCollection,
+    def __init__(self, data_simulator: DataSimulator, effect_simulators: EffectSimulatorCollection,
                  analyzers: AnalyzerCollection, n_reps: int = 1):
         self.data_simulator = data_simulator
         self.effect_simulators = effect_simulators
@@ -82,8 +82,11 @@ class Results():
     
     def create_results_df(self, errors, covered, lengths, digits=3):
         bias = errors.mean(axis=0)
-        avg_bias = float2str_format((bias).mean(axis=2), digits)
         avg_sq_bias = float2str_format((np.square(bias)).mean(axis=2), digits)
+        avg_bias_reps = errors.mean(axis=3)
+        avg_bias_mean = avg_bias_reps.mean(axis=0)
+        avg_bias_se = avg_bias_reps.std(axis=0) / np.sqrt(self.n_reps)
+        avg_bias = print_se_parentheses(avg_bias_mean, avg_bias_se, digits)
 
         mse_reps = (errors**2).mean(axis=3)
         mse_avg = mse_reps.mean(axis=0)
