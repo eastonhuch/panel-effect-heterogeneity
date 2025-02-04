@@ -105,9 +105,12 @@ class WLSMixin():
         sqrt_w = data_simulator.sqrt_w.copy()
 
         # Construct X
-        X = np.ones((N, T, 2*D))
+        X = np.zeros((N, T, 2*D))
         X[:, :, :D] = X_raw.copy()
+        X0 = X.copy()
         X[:, :, D:] = (X_raw.copy().T * a.T).T
+        X1 = X0.copy()
+        X1[:, :, D:] = X_raw.copy()
 
         # Fit regression model
         W_sqrt_X = (X.T * sqrt_w.T).T
@@ -119,7 +122,9 @@ class WLSMixin():
         theta_full_3d = (XtWX_inv @ XtWy)
 
         # Construct fitted values, residuals
-        fitted_values = (X @ theta_full_3d).squeeze()
+        fitted_values = (X @ theta_full_3d)[:, :, 0]
+        fitted_values0 = (X0 @ theta_full_3d)[:, :, 0]
+        fitted_values1 = (X1 @ theta_full_3d)[:, :, 0]
         residuals = y - fitted_values
 
         # Estimate covariance matrix
@@ -132,7 +137,16 @@ class WLSMixin():
         estimated_effects = (X_raw @ beta1_minus_beta0).squeeze()
         tau_hat_dr = residuals / (a - not_p) + estimated_effects
 
-        return theta_full_3d, theta_full_cov, residuals, tau_hat_dr
+        # Return results
+        results = {
+            "theta_full_3d": theta_full_3d,
+            "theta_full_cov": theta_full_cov,
+            "residuals": residuals,
+            "tau_hat_dr": tau_hat_dr,
+            "fitted_values0": fitted_values0,
+            "fitted_values1": fitted_values1}
+
+        return results
     
 
 class TauMixin():
@@ -158,7 +172,9 @@ class WLSAnalyzer(StandaloneAnalyzer, WLSMixin):
     def get_estimates_mean_cov(self, data_simulator: DataSimulator, X: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
         # Get WLS estimates
         N, T, D = X.shape
-        theta_full_3d, theta_full_cov, _, _ = self.wls(data_simulator, X)
+        wls_results = self.wls(data_simulator, X)
+        theta_full_3d = wls_results["theta_full_3d"]
+        theta_full_cov = wls_results["theta_full_cov"]
         estimates = theta_full_3d[:, D:, 0]
         estimates_cov = theta_full_cov[np.ix_(range(N), range(D, 2*D), range(D, 2*D))]
         return estimates, estimates_cov
@@ -168,10 +184,11 @@ class IPWAnalyzer(StandaloneAnalyzer, WLSMixin, TauMixin):
     """Inverse-probability weighting analyzer.
     This approach is unbiased, but is not very efficient.
     """
-    def __init__(self, name: str, alpha: float=0.05, dr: bool = False):
+    def __init__(self, name: str, alpha: float=0.05, dr: bool = False, robust: bool = True):
         self.name = name
         self.alpha = alpha
         self.dr = dr
+        self.robust = robust
 
     def get_estimates_mean_cov(self, data_simulator: DataSimulator, X: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
         # Extract data
@@ -179,14 +196,21 @@ class IPWAnalyzer(StandaloneAnalyzer, WLSMixin, TauMixin):
         a = data_simulator.a.copy()
         p = data_simulator.p.copy()
         y = data_simulator.y.copy()
+        w = data_simulator.w.copy()
         sqrt_w = data_simulator.sqrt_w.copy()
 
         # Get tau_hat
         if self.dr:
-            _, _, residuals, tau_hat = self.wls(data_simulator, X)
+            wls_results = self.wls(data_simulator, X)
+            residuals = wls_results["residuals"]
+            tau_hat = wls_results["tau_hat_dr"]
+            fitted0 = wls_results["fitted_values0"]
+            fitted1 = wls_results["fitted_values1"]
         else:
+            residuals = y.copy()
             tau_hat = self.get_tau_hat(data_simulator, X)
-            residuals = y
+            fitted0 = np.zeros_like(y)
+            fitted1 = np.zeros_like(y)
         tau_hat_row_vectors = tau_hat[:, np.newaxis, :]
 
         # Generate estimates
@@ -196,12 +220,19 @@ class IPWAnalyzer(StandaloneAnalyzer, WLSMixin, TauMixin):
         WX = (X.T * data_simulator.w.T).T
         XtWtau_hat = np.swapaxes(tau_hat_row_vectors @ WX, 1, 2)
         estimates_3d = (XtWX_inv @ XtWtau_hat)
+        estimated_effects = (X @ estimates_3d)[:, :, 0]
         estimates = estimates_3d[:, :, 0]
 
         # Estimate covariance
-        s = (a-p) * residuals / (p * (1. - p))
-        W_sqrt_S_X = (X.T * (s.T * sqrt_w.T)).T
-        meat = np.swapaxes(W_sqrt_S_X, 1, 2) @ W_sqrt_S_X
+        a_var = p * (1. - p)
+        if self.robust:  # Conservative Neyman estimator
+            s = (a-p) * residuals / a_var
+        else:  # Model-based estimates
+            s0 = y - fitted0 - a * estimated_effects
+            s1 = y - fitted1 + (1.-a) * estimated_effects
+            s = ((1.-p) * s1 + p * s0) / np.sqrt(a_var)
+        W_S_X = (X.T * (s*w).T).T
+        meat = np.swapaxes(W_S_X, 1, 2) @ W_S_X
         estimates_cov = XtWX_inv @ meat @ XtWX_inv
 
         return estimates, estimates_cov
@@ -229,10 +260,16 @@ class SIPWAnalyzer(StandaloneAnalyzer, WLSMixin, TauMixin):
 
         # Get tau_hat
         if self.dr:
-            _, _, residuals, tau_hat = self.wls(data_simulator, X)
+            wls_results = self.wls(data_simulator, X)
+            residuals = wls_results["residuals"]
+            tau_hat = wls_results["tau_hat_dr"]
+            fitted0 = wls_results["fitted_values0"]
+            fitted1 = wls_results["fitted_values1"]
         else:
+            residuals = y.copy()
             tau_hat = self.get_tau_hat(data_simulator, X)
-            residuals = y
+            fitted0 = np.zeros_like(y)
+            fitted1 = np.zeros_like(y)
 
         # Get estimates
         awp0 = not_a*w/not_p
