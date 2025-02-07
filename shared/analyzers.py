@@ -11,6 +11,10 @@ class BaseAnalyzer(ABC):
     name: str
     alpha: float
 
+    def __init__(self, name: str, alpha: float=0.05):
+        self.name = name
+        self.alpha = alpha
+
     @abstractmethod
     def get_inferences(self, data_simulator: DataSimulator, X: np.ndarray) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
         pass
@@ -134,7 +138,7 @@ class WLSMixin():
 
         # Create tau_hat_dr
         beta1_minus_beta0 = theta_full_3d[:, D:]
-        estimated_effects = (X_raw @ beta1_minus_beta0).squeeze()
+        estimated_effects = (X_raw @ beta1_minus_beta0)[:, :, 0]
         tau_hat_dr = residuals / (a - not_p) + estimated_effects
 
         # Return results
@@ -165,10 +169,6 @@ class WLSAnalyzer(StandaloneAnalyzer, WLSMixin):
     In general, this method is biased for the treatment effects.
     We include it as a baseline for comparison.
     """
-    def __init__(self, name: str, alpha: float=0.05):
-        self.name = name
-        self.alpha = alpha
-
     def get_estimates_mean_cov(self, data_simulator: DataSimulator, X: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
         # Get WLS estimates
         N, T, D = X.shape
@@ -184,11 +184,10 @@ class IPWAnalyzer(StandaloneAnalyzer, WLSMixin, TauMixin):
     """Inverse-probability weighting analyzer.
     This approach is unbiased, but is not very efficient.
     """
-    def __init__(self, name: str, alpha: float=0.05, dr: bool = False, robust: bool = True):
-        self.name = name
-        self.alpha = alpha
+    def __init__(self, dr: bool = False, robust: bool = True, **kwargs):
         self.dr = dr
         self.robust = robust
+        super().__init__(**kwargs)
 
     def get_estimates_mean_cov(self, data_simulator: DataSimulator, X: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
         # Extract data
@@ -244,11 +243,10 @@ class SIPWAnalyzer(StandaloneAnalyzer, WLSMixin, TauMixin):
     """Stabilized inverse-probability weighting analyzer.
     This approach is unbiased and more efficient than standard IPW.
     """
-    def __init__(self, name: str, alpha: float=0.05, dr: bool = False, robust: bool = True):
-        self.name = name
-        self.alpha = alpha
+    def __init__(self, dr: bool = False, robust: bool = True, **kwargs):
         self.dr = dr
         self.robust = robust
+        super().__init__(**kwargs)
 
     def get_estimates_mean_cov(self, data_simulator: DataSimulator, X: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
         # Extract data
@@ -353,18 +351,8 @@ class SIPWAnalyzer(StandaloneAnalyzer, WLSMixin, TauMixin):
         return estimates, estimates_cov
 
 
-class MetaAnalyzer(BaseAnalyzer):
-    """Meta-analyzer.
-    This approach uses composition to obtain
-    improved estimates via Gaussian meta-analysis.
-    """
-    def __init__(self, analyzer: BaseAnalyzer, name: str, alpha: float=0.05):
-        self.analyzer = analyzer
-        self.name = name
-        self.alpha = alpha
-
-    def get_inferences(self, data_simulator: DataSimulator, X: np.ndarray) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
-        raw_estimates, raw_estimates_cov = self.analyzer.get_estimates_mean_cov(data_simulator, X)
+class MetaAnalysisMixin():
+    def meta_analyze(self, raw_estimates: np.ndarray, raw_estimates_cov: np.ndarray):
         overall_mean, overall_mean_cov, overall_cov = re_mme(raw_estimates, raw_estimates_cov)
         overall_precision = chol_inv_matrix(overall_cov)
         overall_precision_mean = overall_precision @ overall_mean
@@ -373,8 +361,21 @@ class MetaAnalyzer(BaseAnalyzer):
         estimates_cov = chol_inv_stack(estimates_precision)
         estimates_right = overall_precision_mean + raw_estimates_precision @ raw_estimates[:, :, np.newaxis]
         estimates = (estimates_cov @ estimates_right)[:, :, 0]
+        return estimates, estimates_cov, overall_mean, overall_mean_cov, overall_cov
 
-        N, _ = estimates.shape
+
+class MetaAnalyzer(BaseAnalyzer, MetaAnalysisMixin):
+    """Meta-analyzer.
+    This approach uses composition to obtain
+    improved estimates via Gaussian meta-analysis.
+    """
+    def __init__(self, analyzer: StandaloneAnalyzer, **kwargs):
+        self.analyzer = analyzer
+        super().__init__(**kwargs)
+
+    def get_inferences(self, data_simulator: DataSimulator, X: np.ndarray) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+        raw_estimates, raw_estimates_cov = self.analyzer.get_estimates_mean_cov(data_simulator, X)
+        estimates, estimates_cov, overall_mean, overall_mean_cov, overall_cov = self.meta_analyze(raw_estimates, raw_estimates_cov)
         theta_vars = np.diagonal(estimates_cov, axis1=1, axis2=2)
         theta_ses = np.sqrt(theta_vars)
         z_star = norm.ppf(1. - self.alpha / 2.)
