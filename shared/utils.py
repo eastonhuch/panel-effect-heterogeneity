@@ -67,6 +67,9 @@ def re_mme(theta_hats, Sigmas, min_e_value=0.1):
     re_cov_pd_Sigmas_inv_sum_inv = chol_inv_matrix(re_cov_pd_Sigmas_inv_sum)
     re_cov_pd_Sigmas_inv_theta_hat_sum = (re_cov_pd_Sigmas_inv @ theta_hats[:, :, np.newaxis]).sum(axis=0)
     re_mean = (re_cov_pd_Sigmas_inv_sum_inv @ re_cov_pd_Sigmas_inv_theta_hat_sum)[:, 0]
-    re_mean_cov = re_cov_pd_Sigmas_inv_sum
+    re_mean_cov = re_cov_pd_Sigmas_inv_sum_inv
 
-    return re_mean, re_mean_cov, re_cov_pd
+    mean = theta_hats.mean(axis=0)
+    mean_cov = Sigmas.mean(axis=0) / N
+
+    return re_mean, re_mean_cov, re_cov_pd, mean, mean_cov

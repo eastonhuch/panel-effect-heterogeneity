@@ -1,9 +1,8 @@
 import numpy as np
 import pandas as pd
-from scipy.stats import norm
 from abc import ABC, abstractmethod
 from typing import Union, List, Tuple, Optional
-from shared.utils import chol_inv_matrix, chol_inv_stack, re_mme
+from shared.utils import chol_inv_matrix
 from shared.analyzers import MetaAnalysisMixin
 import copy
 
@@ -27,6 +26,7 @@ class BaseRaggedAnalyzer(ABC):
 
     def get_lists(self, df: pd.DataFrame, X: np.ndarray):
         unique_ids = df[self.id_col].unique()
+        df = df.copy().reset_index(drop=True)
         X_list = []
         a_list = []
         p_list = []
@@ -35,7 +35,7 @@ class BaseRaggedAnalyzer(ABC):
         for id in unique_ids:
             is_id = df[self.id_col] == id
             idx_bool = is_id.values
-            idx = is_id.index
+            idx = is_id[idx_bool].index
             X_list.append(X[idx_bool])
             a = df.loc[idx, self.treatment_col].values
             a_list.append(a)
@@ -48,7 +48,7 @@ class BaseRaggedAnalyzer(ABC):
         return X_list, a_list, p_list, y_list, w_list
 
     @abstractmethod
-    def get_inferences(self, df: pd.DataFrame, X: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
+    def fit(self, df: pd.DataFrame, X: np.ndarray) -> "BaseRaggedAnalyzer":
         """Returns estimated means and covariance matrices for each user"""
         pass
 
@@ -60,12 +60,12 @@ class StandaloneRaggedAnalyzer(BaseRaggedAnalyzer):
             y_list: List[np.ndarray], w_list: List[np.ndarray]) -> Tuple[np.ndarray, np.ndarray]:
         pass
 
-    def get_inferences(self, df: pd.DataFrame, X: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
+    def fit(self, df: pd.DataFrame, X: np.ndarray) -> "StandaloneRaggedAnalyzer":
         lists = self.get_lists(df, X)
-        estimates, estimates_cov = self.get_estimates_mean_cov(*lists)
-        overall_mean = estimates.mean(axis=0)
-        overall_mean_cov = estimates_cov.mean(axis=0) / len(estimates)
-        return estimates, estimates_cov, overall_mean, overall_mean_cov
+        self.estimates, self.estimates_cov = self.get_estimates_mean_cov(*lists)
+        self.overall_mean = self.estimates.mean(axis=0)
+        self.overall_mean_cov = self.estimates_cov.mean(axis=0) / X.shape[0]
+        return self
 
 
 class RaggedWLSMixin():
@@ -94,7 +94,7 @@ class RaggedWLSMixin():
             w = w_list[i].copy()
             sqrt_w = np.sqrt(w)
             X_raw = X_list[i].copy()
-            T = X.shape[0]
+            T = X_raw.shape[0]
 
             # Construct X
             X = np.zeros((T, 2*D))
@@ -107,18 +107,18 @@ class RaggedWLSMixin():
             # Fit regression model
             W_sqrt_X = (X.T * sqrt_w).T
             XtWX = W_sqrt_X.T @ W_sqrt_X
-            XtWX_inv = chol_inv_stack(XtWX)
+            XtWX_inv = chol_inv_matrix(XtWX)
             WX = (X.T * w).T
             XtWy = WX.T @ y
-            theta_full_i = (XtWX_inv @ XtWy)[:, 1]
+            theta_full_i = XtWX_inv @ XtWy
             theta_full[i] = theta_full_i
             theta_i = theta_full_i[D:]
             theta[i] = theta_i
 
             # Construct fitted values, residuals
-            fitted_values = X @ theta_i
-            fitted_values0_list.append(X0 @ theta_i)
-            fitted_values1_list.append(X1 @ theta_i)
+            fitted_values = X @ theta_full_i
+            fitted_values0_list.append(X0 @ theta_full_i)
+            fitted_values1_list.append(X1 @ theta_full_i)
             residuals = y - fitted_values
             residual_list.append(residuals)
 
@@ -170,7 +170,7 @@ class WLSAnalyzer(StandaloneRaggedAnalyzer, RaggedWLSMixin):
         return wls_results["theta_list"], wls_results["theta_cov_list"]
 
 
-class IPWAnalyzer(StandaloneRaggedAnalyzer, RaggedWLSMixin, RaggedTauMixin):
+class RaggedIPWAnalyzer(StandaloneRaggedAnalyzer, RaggedWLSMixin, RaggedTauMixin):
     """Inverse-probability weighting analyzer.
     This approach is unbiased, but is not very efficient.
     """
@@ -196,9 +196,9 @@ class IPWAnalyzer(StandaloneRaggedAnalyzer, RaggedWLSMixin, RaggedTauMixin):
             fitted1_list = wls_results["fitted_values1_list"]
         else:
             residual_list = copy.deepcopy(y_list)
-            tau_hat_list = self.get_tau_hat(a_list, p_list, y_list)
+            tau_hat_list = self.get_tau_hat_list(a_list, p_list, y_list)
             fitted0_list = [np.zeros_like(y) for y in y_list]
-            fitted1_list = copy.deepcopy(fitted0)
+            fitted1_list = copy.deepcopy(fitted0_list)
 
         # Loop over users
         for i in range(N):
@@ -243,7 +243,7 @@ class IPWAnalyzer(StandaloneRaggedAnalyzer, RaggedWLSMixin, RaggedTauMixin):
         return estimates, estimates_cov
 
 
-class SIPWAnalyzer(StandaloneRaggedAnalyzer, RaggedWLSMixin, RaggedTauMixin):
+class RaggedSIPWAnalyzer(StandaloneRaggedAnalyzer, RaggedWLSMixin, RaggedTauMixin):
     """Stabilized inverse-probability weighting analyzer.
     This approach is unbiased and more efficient than standard IPW.
     """
@@ -269,9 +269,9 @@ class SIPWAnalyzer(StandaloneRaggedAnalyzer, RaggedWLSMixin, RaggedTauMixin):
             fitted1_list = wls_results["fitted_values1_list"]
         else:
             residual_list = copy.deepcopy(y_list)
-            tau_hat_list = self.get_tau_hat(a_list, p_list, y_list)
+            tau_hat_list = self.get_tau_hat_list(a_list, p_list, y_list)
             fitted0_list = [np.zeros_like(y) for y in y_list]
-            fitted1_list = copy.deepcopy(fitted0)
+            fitted1_list = copy.deepcopy(fitted0_list)
 
         # Loop over users
         for i in range(N):
@@ -298,10 +298,10 @@ class SIPWAnalyzer(StandaloneRaggedAnalyzer, RaggedWLSMixin, RaggedTauMixin):
             B0_inv = chol_inv_matrix(B0)
             B1 = (AWP1X.T @ AWP1X) / T
             B1_inv = chol_inv_matrix(B1)
-            z0 = (X.T * (not_a * w * tau_hat)).mean(axis=0)
-            z1 = (X.T * (a * w * tau_hat)).mean(axis=0)
+            z0 = (X.T * (not_a * w * tau_hat)).mean(axis=1)
+            z1 = (X.T * (a * w * tau_hat)).mean(axis=1)
             estimates_i = B0_inv @ z0 + B1_inv @ z1
-            estimated_effects = (X @ estimates_i)[:, :, 0]
+            estimated_effects = X @ estimates_i
             estimates[i] = estimates_i
 
             # Estimate covariance
@@ -313,7 +313,7 @@ class SIPWAnalyzer(StandaloneRaggedAnalyzer, RaggedWLSMixin, RaggedTauMixin):
             if self.robust:
                 # Control
                 v0_right_tmp = X @ (B_double_inv @ z0)
-                v01_left = B_inv @ (X.T * residuals)
+                v01_left = (B_inv @ (X.T * residuals)).T
                 v0_right = (X.T * v0_right_tmp).T
                 v0 = v01_left + v0_right
                 v0_awp0 = (v0.T * awp0).T
@@ -322,12 +322,12 @@ class SIPWAnalyzer(StandaloneRaggedAnalyzer, RaggedWLSMixin, RaggedTauMixin):
                 # Treatment
                 v1_right_tmp = X @ (B_double_inv @ z1)
                 v1_right = (X.T * v1_right_tmp).T
-                v1 = v01_left + v1_right
+                v1 = v01_left - v1_right
                 v1_awp1 = (v1.T * awp1).T
                 V1 = v1_awp1.T @ v1_awp1
 
                 # Combine
-                estimates_cov = (V0 + V1) / T**2
+                estimates_cov[i] = (V0 + V1) / T**2
             else:
                 # Helper variables
                 y0_imputed = y - a * estimated_effects
@@ -336,18 +336,18 @@ class SIPWAnalyzer(StandaloneRaggedAnalyzer, RaggedWLSMixin, RaggedTauMixin):
                 r1 = y1_imputed - fitted1
 
                 # Control
-                z0_tilde = X.T @ (w*r0)
+                z0_tilde = (X.T @ (w*r0)) / T
                 B_double_inv_z0_tilde = B_double_inv @ z0_tilde
                 v0_right_tmp = X @ B_double_inv_z0_tilde
-                v0_left = B_inv @ (X.T * r0).T
+                v0_left = (B_inv @ (X.T * r0)).T
                 v0_right = (X.T * v0_right_tmp).T
                 v0 = v0_left - v0_right
 
                 # Treatment
-                z1_tilde = X.T @ (w*r1)
+                z1_tilde = (X.T @ (w*r1)) / T
                 B_double_inv_z1_tilde = B_double_inv @ z1_tilde
                 v1_right_tmp = X @ B_double_inv_z1_tilde
-                v1_left = B_inv @ (X.T * r1).T
+                v1_left = (B_inv @ (X.T * r1)).T
                 v1_right = (X.T * v1_right_tmp).T
                 v1 = v1_left - v1_right
 
@@ -356,23 +356,29 @@ class SIPWAnalyzer(StandaloneRaggedAnalyzer, RaggedWLSMixin, RaggedTauMixin):
                 a_var = p * not_p
                 sqrt_a_var = np.sqrt(a_var)
                 W_Vinvsqrt_S = (S.T * (w / sqrt_a_var)).T
-                estimates_cov = (W_Vinvsqrt_S.T @ W_Vinvsqrt_S) / (T**2)
+                estimates_cov[i] = (W_Vinvsqrt_S.T @ W_Vinvsqrt_S) / (T**2)
 
         return estimates, estimates_cov
 
 
-class MetaAnalyzer(BaseRaggedAnalyzer, MetaAnalysisMixin):
+class RaggedMetaAnalyzer(BaseRaggedAnalyzer, MetaAnalysisMixin):
     """Meta-analyzer.
     This approach uses composition to obtain
     improved estimates via Gaussian meta-analysis.
     """
-    def __init__(self, analyzer: StandaloneRaggedAnalyzer, name: str, alpha: float=0.05):
+    def __init__(self, analyzer: StandaloneRaggedAnalyzer, **kwargs):
         self.analyzer = analyzer
-        self.name = name
-        self.alpha = alpha
+        super().__init__(**kwargs)
 
-    def get_inferences(self, df: pd.DataFrame, X: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
+    def fit(self, df: pd.DataFrame, X: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
         lists = self.get_lists(df, X)
         raw_estimates, raw_estimates_cov = self.analyzer.get_estimates_mean_cov(*lists)
-        estimates, estimates_cov, overall_mean, overall_mean_cov, overall_cov = self.meta_analyze(raw_estimates, raw_estimates_cov)
-        return estimates, estimates_cov, overall_mean, overall_mean_cov
+        meta_analysis_results = self.meta_analyze(raw_estimates, raw_estimates_cov)
+        self.estimates = meta_analysis_results[0]
+        self.estimates_cov = meta_analysis_results[1]
+        self.re_mean = meta_analysis_results[2]
+        self.re_mean_cov = meta_analysis_results[3]
+        self.re_cov = meta_analysis_results[4]
+        self.mean = meta_analysis_results[5]
+        self.mean_cov = meta_analysis_results[6]
+        return self

@@ -319,7 +319,7 @@ class SIPWAnalyzer(StandaloneAnalyzer, WLSMixin, TauMixin):
         else:
             # Helper variables
             y0_imputed = y - a * estimated_effects
-            y1_imputed = y + (1.-a) * estimated_effects
+            y1_imputed = y + not_a * estimated_effects
             r0 = y0_imputed - fitted0
             r1 = y1_imputed - fitted1
 
@@ -353,15 +353,15 @@ class SIPWAnalyzer(StandaloneAnalyzer, WLSMixin, TauMixin):
 
 class MetaAnalysisMixin():
     def meta_analyze(self, raw_estimates: np.ndarray, raw_estimates_cov: np.ndarray):
-        overall_mean, overall_mean_cov, overall_cov = re_mme(raw_estimates, raw_estimates_cov)
-        overall_precision = chol_inv_matrix(overall_cov)
-        overall_precision_mean = overall_precision @ overall_mean
+        re_mean, re_mean_cov, re_cov, mean, mean_cov = re_mme(raw_estimates, raw_estimates_cov)
+        overall_precision = chol_inv_matrix(re_cov)
+        overall_precision_mean = overall_precision @ re_mean
         raw_estimates_precision = chol_inv_stack(raw_estimates_cov)
         estimates_precision = overall_precision + raw_estimates_precision
         estimates_cov = chol_inv_stack(estimates_precision)
         estimates_right = overall_precision_mean + raw_estimates_precision @ raw_estimates[:, :, np.newaxis]
         estimates = (estimates_cov @ estimates_right)[:, :, 0]
-        return estimates, estimates_cov, overall_mean, overall_mean_cov, overall_cov
+        return estimates, estimates_cov, re_mean, re_mean_cov, re_cov, mean, mean_cov
 
 
 class MetaAnalyzer(BaseAnalyzer, MetaAnalysisMixin):
@@ -375,7 +375,7 @@ class MetaAnalyzer(BaseAnalyzer, MetaAnalysisMixin):
 
     def get_inferences(self, data_simulator: DataSimulator, X: np.ndarray) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
         raw_estimates, raw_estimates_cov = self.analyzer.get_estimates_mean_cov(data_simulator, X)
-        estimates, estimates_cov, overall_mean, overall_mean_cov, overall_cov = self.meta_analyze(raw_estimates, raw_estimates_cov)
+        estimates, estimates_cov, re_mean, re_mean_cov, re_cov, mean, mean_cov = self.meta_analyze(raw_estimates, raw_estimates_cov)
         theta_vars = np.diagonal(estimates_cov, axis1=1, axis2=2)
         theta_ses = np.sqrt(theta_vars)
         z_star = norm.ppf(1. - self.alpha / 2.)
@@ -384,8 +384,8 @@ class MetaAnalyzer(BaseAnalyzer, MetaAnalysisMixin):
         u_ub = estimates + z_star * theta_ses
 
         # Use the raw estimates for the mean effects
-        m = overall_mean
-        m_var = np.diag(overall_mean_cov)
+        m = mean
+        m_var = np.diag(mean_cov)
         m_se = np.sqrt(m_var)
         m_lb = m - z_star * m_se
         m_ub = m + z_star * m_se
