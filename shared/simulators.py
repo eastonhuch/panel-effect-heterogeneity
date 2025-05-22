@@ -154,12 +154,9 @@ class DataSimulator():
     def simulate_a(self) -> 'DataSimulator':
         self.a = np.random.random(size=self.p.shape) < self.p
         self.not_a = ~self.a.copy()
-        return self
-
-    def simulate_effects(self, effect_generator: BaseEffectSimulator) -> 'DataSimulator':
-        self.y1 = effect_generator.simulate_y1(self.x, self.y0)
+        if self.y1 is None:
+            raise ValueError("y1 must be simulated before simulating a.")
         self.y = self.a * self.y1 + self.not_a * self.y0
-        self.tau = self.y1 - self.y0
 
         # Compute true value of estimands
         # Theta
@@ -179,3 +176,9 @@ class DataSimulator():
         self.user_effects = (self.tau * self.w).mean(axis=1) / w_mean
 
         return self
+
+    def simulate_effects(self, effect_generator: BaseEffectSimulator) -> 'DataSimulator':
+        self.y1 = effect_generator.simulate_y1(self.x, self.y0)
+        self.tau = self.y1 - self.y0
+        return self
+

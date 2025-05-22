@@ -25,14 +25,14 @@ class BaseRaggedAnalyzer(ABC):
         self.weight_col = weight_col
 
     def get_lists(self, df: pd.DataFrame, X: np.ndarray):
-        unique_ids = df[self.id_col].unique()
+        self.unique_ids = np.sort(df[self.id_col].unique())
         df = df.copy().reset_index(drop=True)
         X_list = []
         a_list = []
         p_list = []
         y_list = []
         w_list = []
-        for id in unique_ids:
+        for id in self.unique_ids:
             is_id = df[self.id_col] == id
             idx_bool = is_id.values
             idx = is_id[idx_bool].index
@@ -63,8 +63,10 @@ class StandaloneRaggedAnalyzer(BaseRaggedAnalyzer):
     def fit(self, df: pd.DataFrame, X: np.ndarray) -> "StandaloneRaggedAnalyzer":
         lists = self.get_lists(df, X)
         self.estimates, self.estimates_cov = self.get_estimates_mean_cov(*lists)
+        self.estimates_se = np.sqrt(np.diagonal(self.estimates_cov, axis1=1, axis2=2))
         self.overall_mean = self.estimates.mean(axis=0)
         self.overall_mean_cov = self.estimates_cov.mean(axis=0) / X.shape[0]
+        self.overall_mean_se = np.sqrt(np.diag(self.overall_mean_cov))
         return self
 
 
@@ -368,6 +370,17 @@ class RaggedMetaAnalyzer(BaseRaggedAnalyzer, MetaAnalysisMixin):
     """
     def __init__(self, analyzer: StandaloneRaggedAnalyzer, **kwargs):
         self.analyzer = analyzer
+        analyzer_kwargs = {
+            "name": f"meta-{analyzer.name}",
+            "alpha": analyzer.alpha,
+            "id_col": analyzer.id_col,
+            "treatment_col": analyzer.treatment_col,
+            "prob_col": analyzer.prob_col,
+            "outcome_col": analyzer.outcome_col,
+            "weight_col": analyzer.weight_col}
+        for key in analyzer_kwargs:
+            if key not in kwargs:
+                kwargs[key] = analyzer_kwargs[key]
         super().__init__(**kwargs)
 
     def fit(self, df: pd.DataFrame, X: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
